@@ -1,0 +1,17 @@
+# Node/Next.js
+**/node_modules/
+**/.next/
+**/out/
+.env*
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+venv/
+.venv/
+
+# Data Outputs (Keep your repo clean)
+**/outputs/
+**/outputs/runs/

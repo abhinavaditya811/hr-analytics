@@ -1,0 +1,41 @@
+project:
+  name: "hr-analytics-capstone"
+  version: "0.1.0"
+
+paths:
+  raw_data: "data/raw"
+  interim_data: "data/interim"
+  processed_data: "data/processed"
+  reports: "outputs/reports"
+  figures: "outputs/figures"
+
+data:
+  source_file: "mockup_awards.csv"
+  encoding: "utf-8"
+  columns:
+    message: "message"
+    award_title: "award_title"
+    recipient_title: "recipient_title"
+    nominator_title: "nominator_title"
+
+cleaning:
+  min_message_length: 20
+  non_recognition_keywords:
+    birthday: ["happy birthday", "birthday"]
+    baby: ["new baby", "birth of", "newborn", "baby boy", "baby girl", "welcome baby"]
+    anniversary_personal: ["engagement", "new home", "got the keys", "wedding"]
+    contest: ["wheel spin", "advent", "quiz", "contest winner", "podium"]
+    milestone_service: ["years of service", "10+ years"]
+
+llm:
+  provider: "ollama"
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "llama3:8b"
+    temperature: 0.1
+    max_tokens: 512
+    timeout: 30
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
