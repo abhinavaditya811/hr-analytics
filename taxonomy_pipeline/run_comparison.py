@@ -1,14 +1,3 @@
-"""
-run_comparison.py — Run the taxonomy pipeline with multiple LLM configurations.
-
-Creates separate output directories under outputs/runs/ so the dashboard's
-Pipeline Comparison tab can display side-by-side analysis.
-
-Usage:
-    python run_comparison.py              # Run all configured pipelines
-    python run_comparison.py --dry-run    # Show what would run without executing
-"""
-
 import subprocess
 import sys
 import time
