@@ -11,8 +11,8 @@ if _pipeline_dir not in sys.path:
     sys.path.insert(0, _pipeline_dir)
 
 import pandas as pd
-import config as cfg
-from taxonomy_pipeline.utils import call_llm, get_logger
+from ..taxonomy_pipeline import config as cfg
+from ..taxonomy_pipeline.utils import call_llm, get_logger
 
 logger = get_logger("generate_data")
 
