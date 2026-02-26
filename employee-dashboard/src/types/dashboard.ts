@@ -275,5 +275,5 @@ export interface ComparisonData {
   scores: PipelineScore[];
   categoryOverlap: CategoryOverlap[];
   taxonomyDiff: TaxonomyDiff[];
-  radarMetrics: { metric: string; fullMark: number; [pipeline: string]: number | string }[];
+  radarMetrics: { metric: string; fullMark: number;[pipeline: string]: number | string }[];
 }
