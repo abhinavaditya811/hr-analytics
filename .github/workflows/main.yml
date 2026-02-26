@@ -73,17 +73,18 @@ jobs:
           mkdir -p outputs/runs/ci_${TIMESTAMP}
 
       - name: Generate 100 new synthetic entries
+        env:
+          PYTHONPATH: ${{ github.workspace }}/taxonomy_pipeline
         run: |
-          cd taxonomy_pipeline
-          python ../scripts/generate_new_data.py --count ${{ env.NEW_ROWS }} --output ../data/raw/eval_subset.csv
+          python scripts/generate_new_data.py --count ${{ env.NEW_ROWS }} --output data/raw/eval_subset.csv
           
           # Also append to main CSV for history tracking
           python -c "
           import pandas as pd
           from pathlib import Path
 
-          main_csv = Path('../data/raw/mockup_awards.csv')
-          new_csv = Path('../data/raw/eval_subset.csv')
+          main_csv = Path('data/raw/mockup_awards.csv')
+          new_csv = Path('data/raw/eval_subset.csv')
 
           existing = pd.read_csv(main_csv)
           new_data = pd.read_csv(new_csv)
@@ -195,13 +196,14 @@ jobs:
 
       # ── Generate Evaluation Report ──
       - name: Generate evaluation summary
+        env:
+          PYTHONPATH: ${{ github.workspace }}/taxonomy_pipeline
         run: |
-          cd taxonomy_pipeline
           python -c "
           import json
           from pathlib import Path
 
-          run_dir = Path('../outputs/runs/ci_${RUN_TIMESTAMP}')
+          run_dir = Path('outputs/runs/ci_${RUN_TIMESTAMP}')
 
           # Load outputs
           taxonomy = {}

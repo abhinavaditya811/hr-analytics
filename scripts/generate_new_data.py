@@ -5,9 +5,12 @@ import random
 import sys
 from pathlib import Path
 
-import pandas as pd
+# Ensure taxonomy_pipeline is importable
+_pipeline_dir = str(Path(__file__).resolve().parent.parent / "taxonomy_pipeline")
+if _pipeline_dir not in sys.path:
+    sys.path.insert(0, _pipeline_dir)
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "taxonomy_pipeline"))
+import pandas as pd
 import config as cfg
 from taxonomy_pipeline.utils import call_llm, get_logger
 
