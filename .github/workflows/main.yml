@@ -1,0 +1,396 @@
+name: Taxonomy Evaluation Pipeline
+
+on:
+  schedule:
+    # Every 4 hours
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_phase2:
+        description: "Skip Phase 2 (Ollama) entirely"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  PYTHON_VERSION: "3.13"
+  OLLAMA_MODEL: "llama3:8b"
+  GEMINI_MODEL: "gemini-2.5-flash-lite"
+  NEW_ROWS: "100"
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ── Setup ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          cd taxonomy_pipeline
+          pip install -r requirements.txt 2>/dev/null || pip install pandas anthropic requests python-dotenv
+
+      # ── Ollama Setup ──
+      - name: Install and start Ollama
+        if: ${{ github.event.inputs.skip_phase2 != 'true' }}
+        run: |
+          curl -fsSL https://ollama.ai/install.sh | sh
+          ollama serve &
+          # Wait for Ollama to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:11434/ > /dev/null 2>&1; then
+              echo "Ollama is ready"
+              break
+            fi
+            echo "Waiting for Ollama... ($i/30)"
+            sleep 2
+          done
+
+      - name: Pull Llama model
+        if: ${{ github.event.inputs.skip_phase2 != 'true' }}
+        run: |
+          echo "Pulling ${{ env.OLLAMA_MODEL }}..."
+          ollama pull ${{ env.OLLAMA_MODEL }}
+          echo "Model ready:"
+          ollama list
+
+      # ── Run Pipeline ──
+      - name: Create output directories
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "RUN_TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          mkdir -p outputs/runs/ci_${TIMESTAMP}
+
+      - name: Generate 100 new synthetic entries
+        run: |
+          cd taxonomy_pipeline
+          python ../scripts/generate_new_data.py --count ${{ env.NEW_ROWS }} --output ../data/raw/eval_subset.csv
+          
+          # Also append to main CSV for history tracking
+          python -c "
+          import pandas as pd
+          from pathlib import Path
+
+          main_csv = Path('../data/raw/mockup_awards.csv')
+          new_csv = Path('../data/raw/eval_subset.csv')
+
+          existing = pd.read_csv(main_csv)
+          new_data = pd.read_csv(new_csv)
+
+          before = len(existing)
+          combined = pd.concat([existing, new_data], ignore_index=True)
+          combined.to_csv(main_csv, index=False)
+          print(f'Appended {len(new_data)} rows to main CSV: {before} -> {len(combined)}')
+          "
+
+      - name: Save eval subset metadata
+        run: |
+          python -c "
+          import pandas as pd, json
+          from pathlib import Path
+
+          main_df = pd.read_csv('data/raw/mockup_awards.csv')
+          eval_df = pd.read_csv('data/raw/eval_subset.csv')
+
+          meta = {
+              'total_rows_in_csv': len(main_df),
+              'eval_rows': len(eval_df),
+              'row_range': [len(main_df) - len(eval_df), len(main_df) - 1],
+              'source': 'synthetic (Gemini-generated)',
+              'new_departments': True,
+              'approach': {
+                  'name': 'hybrid' if '${{ github.event.inputs.skip_phase2 }}' != 'true' else 'gemini_only',
+                  'phase_1': {
+                      'provider': 'gemini',
+                      'model': '${GEMINI_MODEL}',
+                  },
+                  'phase_2': {
+                      'provider': 'ollama' if '${{ github.event.inputs.skip_phase2 }}' != 'true' else 'skipped',
+                      'model': '${OLLAMA_MODEL}' if '${{ github.event.inputs.skip_phase2 }}' != 'true' else None,
+                  },
+                  'phase_3': {
+                      'provider': 'gemini',
+                      'model': '${GEMINI_MODEL}',
+                  },
+                  'data_generator': {
+                      'provider': 'gemini',
+                      'model': '${GEMINI_MODEL}',
+                  },
+              },
+          }
+
+          with open('outputs/runs/ci_${RUN_TIMESTAMP}/eval_subset_meta.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+
+          print(f'Eval subset: {meta[\"eval_rows\"]} rows (rows {meta[\"row_range\"]})')
+          print(f'Approach: {meta[\"approach\"][\"name\"]}')
+          "
+
+      - name: Run Phase 1 (Gemini seeds taxonomy)
+        run: |
+          cd taxonomy_pipeline
+          # Use eval subset for taxonomy — the new 100 rows
+          python -c "
+          import config as cfg
+          # Point to eval subset
+          cfg.AWARDS_CSV = cfg.PROJECT_ROOT / 'data' / 'raw' / 'eval_subset.csv'
+          cfg.P1_SAMPLE_SIZE = 100  # all new rows
+          from phase_1_seed import run as phase_1_run
+          phase_1_run()
+          "
+          cp ../outputs/phase_1_taxonomy.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
+
+      - name: Run Phase 2 (Ollama classification)
+        if: ${{ github.event.inputs.skip_phase2 != 'true' }}
+        run: |
+          cd taxonomy_pipeline
+          python -c "
+          import config as cfg
+          from phase_2_bulk import run as phase_2_run
+          from utils import load_json
+
+          # Point to eval subset (100 new rows)
+          cfg.AWARDS_CSV = cfg.PROJECT_ROOT / 'data' / 'raw' / 'eval_subset.csv'
+
+          # Load Phase 1 taxonomy
+          tax_data = load_json(cfg.OUTPUT_DIR / 'phase_1_taxonomy.json')
+          taxonomy = tax_data.get('taxonomy', tax_data)
+
+          print('Phase 2: classifying 100 new rows')
+          results, candidates = phase_2_run(
+              taxonomy=taxonomy,
+              batch_size=cfg.P2_BATCH_SIZE,
+              resume=False,
+          )
+          print(f'Phase 2 done: {len(results)} classifications, {len(candidates)} candidates')
+          "
+          cp ../outputs/phase_2_results.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
+
+      - name: Run Phase 3 (Gemini finalizes)
+        run: |
+          cd taxonomy_pipeline
+          python -c "
+          import config as cfg
+          cfg.AWARDS_CSV = cfg.PROJECT_ROOT / 'data' / 'raw' / 'eval_subset.csv'
+          from phase_3_finalize import run as phase_3_run
+          phase_3_run()
+          "
+          cp ../outputs/phase_3_final.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
+          cp ../outputs/final_taxonomy.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
+
+      - name: Copy pipeline summary
+        run: |
+          cp outputs/pipeline_summary.json outputs/runs/ci_${RUN_TIMESTAMP}/ 2>/dev/null || true
+
+      # ── Generate Evaluation Report ──
+      - name: Generate evaluation summary
+        run: |
+          cd taxonomy_pipeline
+          python -c "
+          import json
+          from pathlib import Path
+
+          run_dir = Path('../outputs/runs/ci_${RUN_TIMESTAMP}')
+
+          # Load outputs
+          taxonomy = {}
+          phase2 = {}
+          subset_meta = {}
+
+          tax_path = run_dir / 'final_taxonomy.json'
+          p2_path = run_dir / 'phase_2_results.json'
+          meta_path = run_dir / 'eval_subset_meta.json'
+
+          if tax_path.exists():
+              with open(tax_path) as f:
+                  taxonomy = json.load(f)
+
+          if p2_path.exists():
+              with open(p2_path) as f:
+                  phase2 = json.load(f)
+
+          if meta_path.exists():
+              with open(meta_path) as f:
+                  subset_meta = json.load(f)
+
+          # Compute metrics
+          categories = taxonomy.get('categories', [])
+          classifications = phase2.get('classifications', [])
+          candidates = phase2.get('candidate_categories', {})
+
+          valid_ids = {c['id'] for c in categories}
+          valid_sub_ids = set()
+          for cat in categories:
+              for sub in cat.get('subcategories', []):
+                  valid_sub_ids.add(sub['id'])
+
+          total = len(classifications)
+          malformed = sum(1 for c in classifications if not c.get('category') or c['category'].strip() not in valid_ids)
+          correct_sub = sum(1 for c in classifications if c.get('subcategory') and c['subcategory'].strip() in valid_sub_ids)
+
+          # Category distribution
+          cat_dist = {}
+          for c in classifications:
+              cat_id = (c.get('category') or '').strip()
+              if cat_id in valid_ids:
+                  cat_dist[cat_id] = cat_dist.get(cat_id, 0) + 1
+
+          # Bias
+          if cat_dist and total > 0:
+              max_count = max(cat_dist.values())
+              expected = total / max(1, len(valid_ids))
+              bias_score = round((max_count / expected - 1) * 100, 1)
+              bias_cat = max(cat_dist, key=cat_dist.get)
+          else:
+              bias_score = 0
+              bias_cat = 'N/A'
+
+          report = {
+              'timestamp': '${RUN_TIMESTAMP}',
+              'git_sha': '$(git rev-parse --short HEAD)',
+              'trigger': 'schedule' if '${{ github.event_name }}' == 'schedule' else 'manual',
+              'approach': subset_meta.get('approach', {}),
+              'data': {
+                  'total_rows_in_csv': subset_meta.get('total_rows_in_csv', 0),
+                  'eval_rows': subset_meta.get('eval_rows', total),
+                  'row_range': subset_meta.get('row_range', [0, 0]),
+                  'source': subset_meta.get('source', 'synthetic'),
+                  'new_departments': subset_meta.get('new_departments', True),
+                  'description': '${NEW_ROWS} synthetic rows (Gemini-generated, new departments + varied tone)',
+              },
+              'taxonomy': {
+                  'categories': len(categories),
+                  'subcategories': sum(len(c.get('subcategories', [])) for c in categories),
+                  'category_names': [c['name'] for c in categories],
+              },
+              'classification': {
+                  'messages_evaluated': subset_meta.get('eval_rows', total),
+                  'total_classified': total,
+                  'success_rate': round(total / max(1, subset_meta.get('eval_rows', total)) * 100, 1),
+                  'malformed_count': malformed,
+                  'malformed_pct': round(malformed / max(1, total) * 100, 1),
+                  'format_consistency_pct': round(correct_sub / max(1, total) * 100, 1),
+                  'bias_category': bias_cat,
+                  'bias_score': bias_score,
+                  'category_distribution': cat_dist,
+              },
+              'discovery': {
+                  'candidates_found': len(candidates),
+                  'candidates_above_threshold': sum(1 for v in candidates.values() if v >= 3),
+                  'top_candidates': dict(sorted(candidates.items(), key=lambda x: x[1], reverse=True)[:5]),
+              },
+          }
+
+          # Save report
+          report_path = run_dir / 'evaluation_report.json'
+          with open(report_path, 'w') as f:
+              json.dump(report, f, indent=2)
+
+          # Print summary for action log
+          print('=' * 60)
+          print(f'EVALUATION REPORT — {report[\"timestamp\"]}')
+          print('=' * 60)
+          approach = report.get('approach', {})
+          print(f'Approach: {approach.get(\"name\", \"unknown\")}')
+          print(f'  Phase 1: {approach.get(\"phase_1\", {}).get(\"provider\", \"?\")} ({approach.get(\"phase_1\", {}).get(\"model\", \"?\")})')
+          print(f'  Phase 2: {approach.get(\"phase_2\", {}).get(\"provider\", \"?\")} ({approach.get(\"phase_2\", {}).get(\"model\", \"?\")})')
+          print(f'  Phase 3: {approach.get(\"phase_3\", {}).get(\"provider\", \"?\")} ({approach.get(\"phase_3\", {}).get(\"model\", \"?\")})')
+          print(f'Data: {report[\"data\"][\"eval_rows\"]} new rows (rows {report[\"data\"][\"row_range\"]})')
+          print(f'Taxonomy: {report[\"taxonomy\"][\"categories\"]} categories, {report[\"taxonomy\"][\"subcategories\"]} subcategories')
+          print(f'Classification: {total} / {report[\"data\"][\"eval_rows\"]} messages')
+          print(f'Success Rate: {report[\"classification\"][\"success_rate\"]}%')
+          print(f'Malformed: {report[\"classification\"][\"malformed_pct\"]}%')
+          print(f'Format Consistency: {report[\"classification\"][\"format_consistency_pct\"]}%')
+          print(f'Bias: {bias_cat} at +{bias_score}%')
+          print(f'Candidates Found: {report[\"discovery\"][\"candidates_found\"]}')
+          print('=' * 60)
+          "
+
+      # ── Update evaluation history ──
+      - name: Update evaluation history
+        run: |
+          python -c "
+          import json
+          from pathlib import Path
+
+          history_path = Path('outputs/evaluation_history.json')
+          report_path = Path('outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json')
+
+          # Load existing history
+          history = []
+          if history_path.exists():
+              with open(history_path) as f:
+                  history = json.load(f)
+
+          # Append new report
+          with open(report_path) as f:
+              report = json.load(f)
+
+          history.append(report)
+
+          # Keep last 50 runs
+          history = history[-50:]
+
+          with open(history_path, 'w') as f:
+              json.dump(history, f, indent=2)
+
+          print(f'History updated: {len(history)} total runs')
+          "
+
+      # ── Commit Results ──
+      - name: Commit evaluation results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add outputs/runs/ci_${RUN_TIMESTAMP}/
+          git add outputs/evaluation_history.json
+          git add data/raw/mockup_awards.csv
+          git add data/raw/eval_subset.csv
+
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            APPROACH=$(cat outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json | python -c 'import sys,json; d=json.load(sys.stdin); print(d.get("approach",{}).get("name","unknown"))')
+            CATS=$(cat outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json | python -c 'import sys,json; d=json.load(sys.stdin); print(f"{d[\"taxonomy\"][\"categories\"]} categories")')
+            RATE=$(cat outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json | python -c 'import sys,json; d=json.load(sys.stdin); print(f"{d[\"classification\"][\"success_rate\"]}%")')
+            MALFORMED=$(cat outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json | python -c 'import sys,json; d=json.load(sys.stdin); print(f"{d[\"classification\"][\"malformed_pct\"]}%")')
+            ROWS=$(cat outputs/runs/ci_${RUN_TIMESTAMP}/evaluation_report.json | python -c 'import sys,json; d=json.load(sys.stdin); print(d["data"]["row_range"])')
+
+            git commit -m "ci: evaluation run ${RUN_TIMESTAMP} [${APPROACH}] (${NEW_ROWS} synthetic rows)
+
+          Approach: ${APPROACH}
+          Phase 1: gemini (${GEMINI_MODEL})
+          Phase 2: ollama (${OLLAMA_MODEL})
+          Phase 3: gemini (${GEMINI_MODEL})
+          Generated: ${NEW_ROWS} synthetic entries (new departments + varied tone)
+          Taxonomy: ${CATS}
+          Success Rate: ${RATE}
+          Malformed: ${MALFORMED}
+          Rows evaluated: ${ROWS}
+
+          Triggered by: ${{ github.event_name }}
+          Git SHA: $(git rev-parse --short HEAD)"
+
+            git push
+          fi
+
+      # ── Upload as artifact too (backup) ──
+      - name: Upload evaluation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-${{ env.RUN_TIMESTAMP }}
+          path: outputs/runs/ci_${{ env.RUN_TIMESTAMP }}/
+          retention-days: 30
