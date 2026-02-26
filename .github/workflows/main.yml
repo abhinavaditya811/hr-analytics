@@ -179,13 +179,16 @@ jobs:
           cp ../outputs/phase_2_results.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
 
       - name: Run Phase 3 (Gemini finalizes)
+        env:
+          SKIP_PHASE2: ${{ github.event.inputs.skip_phase2 }}
         run: |
           cd taxonomy_pipeline
           python -c "
-          import config as cfg
+          import os, config as cfg
           cfg.AWARDS_CSV = cfg.PROJECT_ROOT / 'data' / 'raw' / 'eval_subset.csv'
           from phase_3_finalize import run as phase_3_run
-          phase_3_run()
+          skip_p2 = os.environ.get('SKIP_PHASE2', '') == 'true'
+          phase_3_run(candidates={} if skip_p2 else None)
           "
           cp ../outputs/phase_3_final.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
           cp ../outputs/final_taxonomy.json ../outputs/runs/ci_${RUN_TIMESTAMP}/
@@ -198,9 +201,11 @@ jobs:
       - name: Generate evaluation summary
         env:
           PYTHONPATH: ${{ github.workspace }}/taxonomy_pipeline
+          GIT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python -c "
-          import json
+          import json, os
           from pathlib import Path
 
           run_dir = Path('outputs/runs/ci_${RUN_TIMESTAMP}')
@@ -260,8 +265,8 @@ jobs:
 
           report = {
               'timestamp': '${RUN_TIMESTAMP}',
-              'git_sha': '$(git rev-parse --short HEAD)',
-              'trigger': 'schedule' if '${{ github.event_name }}' == 'schedule' else 'manual',
+              'git_sha': os.environ.get('GIT_SHA', 'unknown')[:7],
+              'trigger': 'schedule' if os.environ.get('EVENT_NAME', '') == 'schedule' else 'manual',
               'approach': subset_meta.get('approach', {}),
               'data': {
                   'total_rows_in_csv': subset_meta.get('total_rows_in_csv', 0),
